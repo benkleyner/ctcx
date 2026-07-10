@@ -14,9 +14,11 @@ outputs:
   agents:
     path: AGENTS.md
     title: Project Agent Instructions
+    format: agents
   claude:
     path: CLAUDE.md
     title: Claude Code Instructions
+    format: claude
 
 sections:
   - id: workflow
@@ -41,6 +43,11 @@ rules:
 | `imports: [{ path: context/rust.yaml }]` | Include a local YAML fragment. Imports resolve relative to the declaring YAML and cannot leave the project root. |
 | `outputs.<target>.path` | Generated output path relative to project root. |
 | `outputs.<target>.title` | H1 title of that generated output. |
+| `outputs.<target>.format` | Optional renderer: `markdown` (default), `agents`, `claude`, `cursor`, `copilot`, `windsurf`, `cline`, or `template`. |
+| `outputs.<target>.front_matter` | Optional YAML mapping emitted before the generated header. Renderer-specific metadata is checked while other keys remain allowed. |
+| `outputs.<target>.header` | Optional generated-header policy: `mode: default`, `omit`, or `template` with an inline or file template. |
+| `outputs.<target>.templates.output` | Optional inline/file document template; it must contain `{{sections}}` exactly once. Required for `format: template`. |
+| `outputs.<target>.templates.section` | Optional inline/file section template; it must contain `{{content}}` exactly once. Required for `format: template`. |
 | `sections[].id` | Stable identifier referenced by `rule.section`. |
 | `sections[].order` | Integer ordering; default `1000`. |
 | `rules[].id` | Globally unique stable rule identifier. |
@@ -52,6 +59,34 @@ rules:
 | `rules[].order` | Integer ordering inside a section; default `1000`. |
 
 Imports, Markdown files, and `ctcx.yaml` are source dependencies. Their content changes make generated output stale. The generated manifest records provenance and output hashes.
+
+## Renderers and templates
+
+`agents` accepts any output named `AGENTS.md`; `claude` accepts any `CLAUDE.md`. The other first-class renderers require their documented project locations: Cursor `.cursor/rules/**/*.mdc`, Copilot `.github/copilot-instructions.md` or `.github/instructions/**/*.instructions.md`, Windsurf `.windsurf/rules/**/*.md`, and Cline `.clinerules/**/*.md` or `.txt`. `markdown` and `template` accept any safe project-relative destination.
+
+Front matter is a YAML mapping and remains extensible. Cursor validates `description` (string), `globs` (string or list), and `alwaysApply` (Boolean). Path-specific Copilot files require a non-empty `applyTo` string. Windsurf requires `trigger: always_on | glob | model_decision | manual`; `glob` requires `globs`, while `model_decision` requires `description`. Cline validates optional `paths` as a string or list.
+
+Templates accept either `inline` or `file`; template files may use any extension, resolve relative to `ctcx.yaml`, must remain inside the project root, and are tracked as source dependencies. The strict placeholders available to output templates are `project_name`, `output_name`, `output_path`, `title`, `renderer`, `fingerprint`, `front_matter`, `generated_header`, and `sections`. Section templates additionally receive `section_id`, `section_title`, `section_order`, and `content`.
+
+```yaml
+outputs:
+  cursor:
+    path: .cursor/rules/project.mdc
+    title: Project rules
+    format: cursor
+    front_matter:
+      description: Project workflow
+      alwaysApply: true
+
+  custom:
+    path: generated/context.txt
+    title: Custom context
+    format: template
+    header: { mode: omit }
+    templates:
+      output: { file: templates/output.txt }
+      section: { inline: "[{{section_title}}] {{content}}" }
+```
 
 ## Target-specific replacement
 

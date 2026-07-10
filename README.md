@@ -42,9 +42,11 @@ outputs:
   agents:
     path: AGENTS.md
     title: Project Agent Instructions
+    format: agents
   claude:
     path: CLAUDE.md
     title: Claude Code Instructions
+    format: claude
 
 sections:
   - id: workflow
@@ -92,6 +94,66 @@ rules: []
 ```
 
 All imports are local, resolved relative to the YAML file that declares them, and confined to the project root. `ctcx` reports the full path when it detects an import cycle.
+
+## Output formats and templates
+
+`format` defaults to `markdown`, preserving the original generated Markdown layout. The first-class formats validate their conventional destinations while still rendering one configured output file per target:
+
+| Format | Accepted destination |
+| --- | --- |
+| `agents` | Any `AGENTS.md` |
+| `claude` | Any `CLAUDE.md` |
+| `cursor` | `.cursor/rules/**/*.mdc` |
+| `copilot` | `.github/copilot-instructions.md` or `.github/instructions/**/*.instructions.md` |
+| `windsurf` | `.windsurf/rules/**/*.md` |
+| `cline` | `.clinerules/**/*.md` or `.clinerules/**/*.txt` |
+| `template` | Any project-relative path; requires both templates |
+
+Use `front_matter` for a YAML mapping. It is emitted before the generated header. Known tool metadata is type-checked without rejecting additional keys: Cursor validates `description`, `globs`, and `alwaysApply`; path-specific Copilot instructions require `applyTo`; Windsurf requires `trigger` (and `globs` or `description` where applicable); Cline validates `paths`.
+
+```yaml
+outputs:
+  cursor:
+    path: .cursor/rules/project.mdc
+    title: Project rules
+    format: cursor
+    front_matter:
+      description: Shared project workflow
+      globs: ["src/**/*.rs"]
+      alwaysApply: true
+
+  windsurf:
+    path: .windsurf/rules/project.md
+    title: Project rules
+    format: windsurf
+    front_matter:
+      trigger: always_on
+```
+
+Every output has the default generated provenance header. Override it or omit it per output:
+
+```yaml
+header:
+  mode: template # default, omit, or template
+  template:
+    inline: "<!-- {{renderer}} rules for {{project_name}} -->"
+```
+
+`templates.output` and `templates.section` accept the same `inline` or `file` source form as rule content. Template files are local source dependencies and make generated outputs stale when changed. Templates use strict placeholders—unknown, malformed, or unmatched placeholders fail compilation. Output templates must include `{{sections}}` exactly once and section templates must include `{{content}}` exactly once.
+
+```yaml
+outputs:
+  custom:
+    path: generated/context.txt
+    title: Custom context
+    format: template
+    header: { mode: omit }
+    templates:
+      output: { inline: "BEGIN {{output_name}}\n{{sections}}" }
+      section: { inline: "[{{section_id}}] {{content}}" }
+```
+
+Output templates can use `{{project_name}}`, `{{output_name}}`, `{{output_path}}`, `{{title}}`, `{{renderer}}`, `{{fingerprint}}`, `{{front_matter}}`, `{{generated_header}}`, and `{{sections}}`. Section templates additionally use `{{section_id}}`, `{{section_title}}`, `{{section_order}}`, and `{{content}}`.
 
 ## Guardrail checks
 
