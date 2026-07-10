@@ -751,19 +751,19 @@ fn validate_check(root: &Path, check: &Check) -> std::result::Result<(), String>
             if !canonical.is_file() {
                 return Err(format!(
                     "package manifest {} is not a file",
-                    manifest.display()
+                    path_string(manifest)
                 ));
             }
             let text = fs::read_to_string(&canonical).map_err(|error| {
                 format!(
                     "failed to read package manifest {}: {error}",
-                    manifest.display()
+                    path_string(manifest)
                 )
             })?;
             let package: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
                 format!(
                     "failed to parse package manifest {} as JSON: {error}",
-                    manifest.display()
+                    path_string(manifest)
                 )
             })?;
             let scripts = package
@@ -772,19 +772,19 @@ fn validate_check(root: &Path, check: &Check) -> std::result::Result<(), String>
                 .ok_or_else(|| {
                     format!(
                         "package manifest {} does not define a scripts object",
-                        manifest.display()
+                        path_string(manifest)
                     )
                 })?;
             let Some(command) = scripts.get(script) else {
                 return Err(format!(
                     "script {script:?} does not exist in package manifest {}",
-                    manifest.display()
+                    path_string(manifest)
                 ));
             };
             if !command.is_string() {
                 return Err(format!(
                     "script {script:?} in package manifest {} must be a string",
-                    manifest.display()
+                    path_string(manifest)
                 ));
             }
             Ok(())
@@ -801,7 +801,7 @@ fn validate_check(root: &Path, check: &Check) -> std::result::Result<(), String>
             } else {
                 Err(format!(
                     "required path {} is not a {}",
-                    path.display(),
+                    path_string(path),
                     path_kind_name(*kind)
                 ))
             }
@@ -817,15 +817,18 @@ fn canonicalize_checked_path(
     let path = root.join(relative);
     let canonical = path.canonicalize().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            format!("{kind} {} does not exist", relative.display())
+            format!("{kind} {} does not exist", path_string(relative))
         } else {
-            format!("failed to resolve {kind} {}: {error}", relative.display())
+            format!(
+                "failed to resolve {kind} {}: {error}",
+                path_string(relative)
+            )
         }
     })?;
     if !canonical.starts_with(root) {
         return Err(format!(
             "{kind} {} resolves outside the project root",
-            relative.display()
+            path_string(relative)
         ));
     }
     Ok(canonical)
@@ -835,11 +838,11 @@ fn describe_check(check: &Check) -> String {
     match check {
         Check::PackageScript { manifest, script } => format!(
             "package-script check ({}#scripts.{script})",
-            manifest.display()
+            path_string(manifest)
         ),
         Check::PathExists { path, kind } => format!(
             "path-exists check ({}; kind {})",
-            path.display(),
+            path_string(path),
             path_kind_name(*kind)
         ),
     }

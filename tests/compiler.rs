@@ -178,6 +178,32 @@ fn aggregates_guardrail_failures_across_every_effective_target() -> Result<()> {
 }
 
 #[test]
+fn guardrail_diagnostics_use_portable_path_separators() -> Result<()> {
+    let (temp, config) = fixture();
+    let fragment = temp.path().join("context/common.yaml");
+    let mut text = fs::read_to_string(&fragment)?;
+    text.push_str(
+        r#"    checks:
+      - type: package-script
+        manifest: manifests/package.json
+        script: test
+      - type: path-exists
+        path: scripts/setup.sh
+        kind: file
+"#,
+    );
+    write(&fragment, &text);
+
+    let project = load_project(&config)?;
+    let error = compile_project(&project).unwrap_err().to_string();
+    assert!(error.contains("package-script check (manifests/package.json#scripts.test)"));
+    assert!(error.contains("package manifest manifests/package.json does not exist"));
+    assert!(error.contains("path-exists check (scripts/setup.sh; kind file)"));
+    assert!(error.contains("required path scripts/setup.sh does not exist"));
+    Ok(())
+}
+
+#[test]
 fn skips_checks_for_targets_where_the_rule_is_suppressed() -> Result<()> {
     let (temp, config) = fixture();
     write(&temp.path().join("package.json"), r#"{"scripts":{}}"#);
