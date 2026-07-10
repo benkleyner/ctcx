@@ -119,6 +119,38 @@ Checks run after rule precedence is resolved. Each check must pass for every tar
 
 Checks are explicit contracts. `ctcx` does not infer commands from Markdown or validate arbitrary executables, shell syntax, Cargo targets, Make targets, or runtime `PATH` availability. Bun, npm, pnpm, and Yarn scripts all use the same package-manifest check.
 
+## Conditional rules
+
+An optional `when` expression determines whether a rule is eligible before target selection, slot precedence, rendering, and guardrail checks. Conditions are deterministic filesystem facts evaluated relative to the project root:
+
+```yaml
+rules:
+  - id: rust-workflow
+    targets: ["*"]
+    section: workflow
+    content:
+      inline: Use Cargo for project commands.
+    when:
+      type: all
+      conditions:
+        - type: path-exists
+          path: Cargo.toml
+          kind: file
+        - type: any
+          conditions:
+            - type: path-exists
+              path: src
+              kind: directory
+            - type: not
+              condition:
+                type: path-exists
+                path: legacy
+```
+
+`all` and `any` require at least one nested condition. `not` accepts exactly one. `path-exists` accepts a project-root-relative `path` and an optional `kind` of `any` (the default), `file`, or `directory`. Use `not` with `path-exists` to require that a path is absent.
+
+Every nested condition is evaluated, so invalid paths and symlinks resolving outside the project root always fail safely. A false rule is inapplicable: it cannot win or suppress a slot and its checks do not run. The final Boolean result for every rule is included in the source fingerprint; a filesystem change that changes rule eligibility makes `ctcx check` report stale generated context. Use `ctcx explain` to see inapplicable rules.
+
 ## Rule precedence
 
 Rules are additive by default. Rules become mutually exclusive when they use the same `slot` for the same target. The highest numeric `priority` wins; a tie is a validation error.

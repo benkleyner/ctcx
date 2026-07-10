@@ -1,6 +1,6 @@
 use crate::model::{
     MANIFEST_VERSION, Manifest, ManifestDependency, ManifestOutput, ManifestSuppressed, RawCheck,
-    RawDocument, RawPathKind, RawRule, SCHEMA_VERSION,
+    RawCondition, RawDocument, RawPathKind, RawRule, SCHEMA_VERSION,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
@@ -53,7 +53,16 @@ pub struct Rule {
     pub content: String,
     pub source: PathBuf,
     pub content_source: Option<PathBuf>,
+    pub when: Option<Condition>,
     pub checks: Vec<Check>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    All(Vec<Condition>),
+    Any(Vec<Condition>),
+    Not(Box<Condition>),
+    PathExists { path: PathBuf, kind: PathKind },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +101,7 @@ pub struct CompiledOutput {
     pub sha256: String,
     pub applied: Vec<String>,
     pub suppressed: Vec<Suppression>,
+    pub inapplicable: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +121,7 @@ pub enum BuildSafety {
 pub enum ExplainStatus {
     Applied,
     Suppressed { winner: String },
+    Inapplicable,
     NotTargeted,
 }
 
@@ -508,6 +519,7 @@ impl Loader {
             .iter()
             .map(resolve_check)
             .collect::<Result<Vec<_>>>()?;
+        let when = raw.when.as_ref().map(resolve_condition).transpose()?;
 
         Ok(Rule {
             id: raw.id.clone(),
@@ -519,8 +531,49 @@ impl Loader {
             content,
             source: source.to_path_buf(),
             content_source,
+            when,
             checks,
         })
+    }
+}
+
+fn resolve_condition(raw: &RawCondition) -> Result<Condition> {
+    match raw {
+        RawCondition::All { conditions } => {
+            ensure!(
+                !conditions.is_empty(),
+                "all condition must contain at least one condition"
+            );
+            Ok(Condition::All(
+                conditions
+                    .iter()
+                    .map(resolve_condition)
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        }
+        RawCondition::Any { conditions } => {
+            ensure!(
+                !conditions.is_empty(),
+                "any condition must contain at least one condition"
+            );
+            Ok(Condition::Any(
+                conditions
+                    .iter()
+                    .map(resolve_condition)
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        }
+        RawCondition::Not { condition } => {
+            Ok(Condition::Not(Box::new(resolve_condition(condition)?)))
+        }
+        RawCondition::PathExists { path, kind } => Ok(Condition::PathExists {
+            path: normalize_relative(path).with_context(|| "invalid path-exists condition path")?,
+            kind: match kind {
+                RawPathKind::Any => PathKind::Any,
+                RawPathKind::File => PathKind::File,
+                RawPathKind::Directory => PathKind::Directory,
+            },
+        }),
     }
 }
 
@@ -550,7 +603,20 @@ fn resolve_check(raw: &RawCheck) -> Result<Check> {
 }
 
 pub fn compile_project(project: &Project) -> Result<CompiledProject> {
-    let source_fingerprint = source_fingerprint(project);
+    let condition_results = project
+        .rules
+        .iter()
+        .map(|rule| {
+            let result = rule
+                .when
+                .as_ref()
+                .map(|condition| evaluate_condition(&project.root, condition))
+                .transpose()?
+                .unwrap_or(true);
+            Ok((rule.id.clone(), result))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let source_fingerprint = source_fingerprint(project, &condition_results);
     let mut compiled_outputs = BTreeMap::new();
     let mut effective_checks = BTreeMap::<(&str, usize), Vec<String>>::new();
 
@@ -559,10 +625,24 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
             .rules
             .iter()
             .filter(|rule| {
-                rule.targets
-                    .iter()
-                    .any(|item| item == "*" || item == target)
+                condition_results[&rule.id]
+                    && rule
+                        .targets
+                        .iter()
+                        .any(|item| item == "*" || item == target)
             })
+            .collect::<Vec<_>>();
+        let mut inapplicable = project
+            .rules
+            .iter()
+            .filter(|rule| {
+                !condition_results[&rule.id]
+                    && rule
+                        .targets
+                        .iter()
+                        .any(|item| item == "*" || item == target)
+            })
+            .map(|rule| rule.id.clone())
             .collect::<Vec<_>>();
         let mut selected = applicable
             .iter()
@@ -632,6 +712,7 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
                 .cmp(&right.slot)
                 .then_with(|| left.rule.cmp(&right.rule))
         });
+        inapplicable.sort();
 
         for rule in &selected {
             for index in 0..rule.checks.len() {
@@ -657,6 +738,7 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
                 content,
                 applied,
                 suppressed,
+                inapplicable,
             },
         );
     }
@@ -708,6 +790,45 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
         outputs: compiled_outputs,
         manifest,
     })
+}
+
+fn evaluate_condition(root: &Path, condition: &Condition) -> Result<bool> {
+    match condition {
+        Condition::All(conditions) => Ok(conditions
+            .iter()
+            .map(|condition| evaluate_condition(root, condition))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|result| result)),
+        Condition::Any(conditions) => Ok(conditions
+            .iter()
+            .map(|condition| evaluate_condition(root, condition))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .any(|result| result)),
+        Condition::Not(condition) => Ok(!evaluate_condition(root, condition)?),
+        Condition::PathExists { path, kind } => {
+            let candidate = root.join(path);
+            let canonical = match candidate.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to resolve path-exists condition {}",
+                            path_string(path)
+                        )
+                    });
+                }
+            };
+            ensure_inside(root, &canonical, "path-exists condition")?;
+            Ok(match kind {
+                PathKind::Any => true,
+                PathKind::File => canonical.is_file(),
+                PathKind::Directory => canonical.is_dir(),
+            })
+        }
+    }
 }
 
 fn validate_effective_checks(
@@ -1169,6 +1290,12 @@ pub fn explain_target(
             )?;
         }
     }
+    for id in &output.inapplicable {
+        let rule = rule_map[id.as_str()];
+        if slot.is_none() || rule.slot.as_deref() == slot {
+            writeln!(rendered, "  inapplicable {} [condition=false]", rule.id)?;
+        }
+    }
     Ok(rendered)
 }
 
@@ -1202,6 +1329,10 @@ pub fn explain_rule(
             ExplainStatus::Suppressed { winner } => {
                 writeln!(rendered, "  {target}: suppressed by {winner}")?
             }
+            ExplainStatus::Inapplicable => writeln!(
+                rendered,
+                "  {target}: inapplicable (condition evaluated false)"
+            )?,
             ExplainStatus::NotTargeted => writeln!(rendered, "  {target}: not targeted")?,
         }
     }
@@ -1215,6 +1346,8 @@ fn rule_status(output: &CompiledOutput, rule_id: &str) -> ExplainStatus {
         ExplainStatus::Suppressed {
             winner: item.winner.clone(),
         }
+    } else if output.inapplicable.iter().any(|id| id == rule_id) {
+        ExplainStatus::Inapplicable
     } else {
         ExplainStatus::NotTargeted
     }
@@ -1325,7 +1458,7 @@ fn read_manifest(path: &Path) -> Result<Option<Manifest>> {
     Ok(Some(manifest))
 }
 
-fn source_fingerprint(project: &Project) -> String {
+fn source_fingerprint(project: &Project, condition_results: &BTreeMap<String, bool>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!(
         "schema={SCHEMA_VERSION}\ncompiler={}\n",
@@ -1335,6 +1468,13 @@ fn source_fingerprint(project: &Project) -> String {
         hasher.update(dependency.relative_path.as_bytes());
         hasher.update([0]);
         hasher.update(dependency.sha256.as_bytes());
+        hasher.update(b"\n");
+    }
+    for (rule_id, result) in condition_results {
+        hasher.update(b"condition=");
+        hasher.update(rule_id.as_bytes());
+        hasher.update(b"=");
+        hasher.update(if *result { "true" } else { "false" }.as_bytes());
         hasher.update(b"\n");
     }
     hex::encode(hasher.finalize())

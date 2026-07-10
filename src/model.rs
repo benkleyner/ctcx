@@ -68,7 +68,28 @@ pub struct RawRule {
     pub order: i32,
     pub content: RawContent,
     #[serde(default)]
+    pub when: Option<RawCondition>,
+    #[serde(default)]
     pub checks: Vec<RawCheck>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RawCondition {
+    All {
+        conditions: Vec<RawCondition>,
+    },
+    Any {
+        conditions: Vec<RawCondition>,
+    },
+    Not {
+        condition: Box<RawCondition>,
+    },
+    PathExists {
+        path: PathBuf,
+        #[serde(default)]
+        kind: RawPathKind,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]

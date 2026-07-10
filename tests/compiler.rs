@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ctcx::{
-    BuildSafety, build_project, check_project, compile_project, init_project, load_project,
-    render_diffs,
+    BuildSafety, build_project, check_project, compile_project, explain_rule, explain_target,
+    init_project, load_project, render_diffs,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -556,5 +556,194 @@ fn check_detects_a_manually_modified_manifest() -> Result<()> {
     );
     let report = check_project(&project, &compiled, None)?.to_string();
     assert!(report.contains("manifest contents do not match"));
+    Ok(())
+}
+
+#[test]
+fn conditions_control_rule_eligibility_precedence_checks_and_explain_output() -> Result<()> {
+    let (temp, config) = fixture();
+    write(&temp.path().join("markers/enabled"), "enabled\n");
+    let mut text = fs::read_to_string(&config)?;
+    text.push_str(
+        r#"
+  - id: conditional-package-manager
+    slot: tooling.package-manager
+    priority: 300
+    targets: [agents]
+    section: workflow
+    content:
+      inline: Use the conditional package manager.
+    when:
+      type: all
+      conditions:
+        - type: path-exists
+          path: markers
+          kind: directory
+        - type: any
+          conditions:
+            - type: path-exists
+              path: markers/enabled
+              kind: file
+            - type: not
+              condition:
+                type: path-exists
+                path: legacy
+  - id: disabled-package-manager
+    slot: tooling.package-manager
+    priority: 400
+    targets: [agents]
+    section: workflow
+    content:
+      inline: This rule must not be emitted.
+    when:
+      type: path-exists
+      path: markers/disabled
+      kind: file
+    checks:
+      - type: package-script
+        manifest: missing-package.json
+        script: missing
+"#,
+    );
+    write(&config, &text);
+
+    let project = load_project(&config)?;
+    let compiled = compile_project(&project)?;
+    let agents = &compiled.outputs["agents"];
+    assert!(
+        agents
+            .content
+            .contains("Use the conditional package manager.")
+    );
+    assert!(!agents.content.contains("Use Cargo by default."));
+    assert!(!agents.content.contains("This rule must not be emitted."));
+    assert_eq!(agents.inapplicable, vec!["disabled-package-manager"]);
+    assert_eq!(agents.suppressed[0].rule, "default-package-manager");
+    assert_eq!(agents.suppressed[0].winner, "conditional-package-manager");
+
+    let target_explanation = explain_target(&project, &compiled, "agents", None)?;
+    assert!(target_explanation.contains("inapplicable disabled-package-manager [condition=false]"));
+    let rule_explanation = explain_rule(&project, &compiled, "disabled-package-manager")?;
+    assert!(rule_explanation.contains("agents: inapplicable (condition evaluated false)"));
+    assert!(rule_explanation.contains("claude: not targeted"));
+    Ok(())
+}
+
+#[test]
+fn condition_changes_mark_generated_outputs_stale() -> Result<()> {
+    let (temp, config) = fixture();
+    let mut text = fs::read_to_string(&config)?;
+    text.push_str(
+        r#"
+  - id: feature-marker-guide
+    targets: [agents]
+    section: workflow
+    content:
+      inline: The feature marker is present.
+    when:
+      type: path-exists
+      path: feature-marker
+      kind: file
+"#,
+    );
+    write(&config, &text);
+
+    let project = load_project(&config)?;
+    let compiled = compile_project(&project)?;
+    build_project(&project, &compiled, BuildSafety::Safe, false)?;
+    assert!(check_project(&project, &compiled, None)?.is_clean());
+
+    write(&temp.path().join("feature-marker"), "present\n");
+    let changed_project = load_project(&config)?;
+    let changed_compiled = compile_project(&changed_project)?;
+    let report = check_project(&changed_project, &changed_compiled, Some("agents"))?.to_string();
+    assert!(report.contains("stale output agents"));
+    assert!(
+        changed_compiled.outputs["agents"]
+            .content
+            .contains("The feature marker is present.")
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_invalid_condition_expressions_and_paths() -> Result<()> {
+    let (_temp, config) = fixture();
+    let mut text = fs::read_to_string(&config)?;
+    text.push_str(
+        r#"
+  - id: invalid-condition
+    targets: [agents]
+    section: workflow
+    content: { inline: Invalid }
+    when:
+      type: all
+      conditions: []
+"#,
+    );
+    write(&config, &text);
+    assert!(
+        format!("{:#}", load_project(&config).unwrap_err())
+            .contains("all condition must contain at least one condition")
+    );
+
+    let text = fs::read_to_string(&config)?.replace(
+        "type: all\n      conditions: []",
+        "type: path-exists\n      path: ../outside",
+    );
+    write(&config, &text);
+    assert!(
+        format!("{:#}", load_project(&config).unwrap_err())
+            .contains("invalid path-exists condition path")
+    );
+
+    let text = fs::read_to_string(&config)?
+        .replace("path: ../outside", "path: marker\n      unknown: true");
+    write(&config, &text);
+    assert!(format!("{:#}", load_project(&config).unwrap_err()).contains("unknown field"));
+
+    let text = fs::read_to_string(&config)?.replace("unknown: true", "kind: missing-kind");
+    write(&config, &text);
+    assert!(format!("{:#}", load_project(&config).unwrap_err()).contains("unknown variant"));
+
+    let text = fs::read_to_string(&config)?.replace(
+        "type: path-exists\n      path: marker\n      kind: missing-kind",
+        "type: not",
+    );
+    write(&config, &text);
+    assert!(format!("{:#}", load_project(&config).unwrap_err()).contains("missing field"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_condition_symlinks_that_escape_the_project_root() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let (temp, config) = fixture();
+    let outside = tempfile::tempdir()?;
+    write(&outside.path().join("marker"), "outside\n");
+    symlink(outside.path().join("marker"), temp.path().join("marker"))?;
+    let mut text = fs::read_to_string(&config)?;
+    text.push_str(
+        r#"
+  - id: linked-condition
+    targets: [agents]
+    section: workflow
+    content: { inline: Linked }
+    when:
+      type: path-exists
+      path: marker
+"#,
+    );
+    write(&config, &text);
+
+    let project = load_project(&config)?;
+    assert!(
+        compile_project(&project)
+            .unwrap_err()
+            .to_string()
+            .contains("path-exists condition path")
+    );
     Ok(())
 }
