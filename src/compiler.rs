@@ -1,6 +1,6 @@
 use crate::model::{
-    MANIFEST_VERSION, Manifest, ManifestDependency, ManifestOutput, ManifestSuppressed,
-    RawDocument, RawRule, SCHEMA_VERSION,
+    MANIFEST_VERSION, Manifest, ManifestDependency, ManifestOutput, ManifestSuppressed, RawCheck,
+    RawDocument, RawPathKind, RawRule, SCHEMA_VERSION,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
@@ -53,6 +53,20 @@ pub struct Rule {
     pub content: String,
     pub source: PathBuf,
     pub content_source: Option<PathBuf>,
+    pub checks: Vec<Check>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    PackageScript { manifest: PathBuf, script: String },
+    PathExists { path: PathBuf, kind: PathKind },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Any,
+    File,
+    Directory,
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +503,11 @@ impl Loader {
             "rule {} has empty content",
             raw.id
         );
+        let checks = raw
+            .checks
+            .iter()
+            .map(resolve_check)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Rule {
             id: raw.id.clone(),
@@ -500,13 +519,40 @@ impl Loader {
             content,
             source: source.to_path_buf(),
             content_source,
+            checks,
         })
+    }
+}
+
+fn resolve_check(raw: &RawCheck) -> Result<Check> {
+    match raw {
+        RawCheck::PackageScript { manifest, script } => {
+            let manifest = normalize_relative(manifest)
+                .with_context(|| "invalid package-script manifest path")?;
+            ensure!(
+                !script.trim().is_empty(),
+                "package-script check script may not be empty"
+            );
+            Ok(Check::PackageScript {
+                manifest,
+                script: script.clone(),
+            })
+        }
+        RawCheck::PathExists { path, kind } => Ok(Check::PathExists {
+            path: normalize_relative(path).with_context(|| "invalid path-exists path")?,
+            kind: match kind {
+                RawPathKind::Any => PathKind::Any,
+                RawPathKind::File => PathKind::File,
+                RawPathKind::Directory => PathKind::Directory,
+            },
+        }),
     }
 }
 
 pub fn compile_project(project: &Project) -> Result<CompiledProject> {
     let source_fingerprint = source_fingerprint(project);
     let mut compiled_outputs = BTreeMap::new();
+    let mut effective_checks = BTreeMap::<(&str, usize), Vec<String>>::new();
 
     for (target, output) in &project.outputs {
         let applicable = project
@@ -587,6 +633,15 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
                 .then_with(|| left.rule.cmp(&right.rule))
         });
 
+        for rule in &selected {
+            for index in 0..rule.checks.len() {
+                effective_checks
+                    .entry((&rule.id, index))
+                    .or_default()
+                    .push(target.clone());
+            }
+        }
+
         let content = render_output(project, output, &selected, &source_fingerprint);
         let applied = selected
             .iter()
@@ -605,6 +660,8 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
             },
         );
     }
+
+    validate_effective_checks(project, &effective_checks)?;
 
     let dependencies = project
         .dependencies
@@ -651,6 +708,149 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
         outputs: compiled_outputs,
         manifest,
     })
+}
+
+fn validate_effective_checks(
+    project: &Project,
+    effective_checks: &BTreeMap<(&str, usize), Vec<String>>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for ((rule_id, check_index), targets) in effective_checks {
+        let rule = project
+            .rules
+            .iter()
+            .find(|rule| rule.id == *rule_id)
+            .expect("effective check must reference a loaded rule");
+        let check = &rule.checks[*check_index];
+        if let Err(reason) = validate_check(&project.root, check) {
+            failures.push(format!(
+                "rule {} ({}), targets [{}], {}: {}",
+                rule.id,
+                display_relative(&project.root, &rule.source),
+                targets.join(", "),
+                describe_check(check),
+                reason
+            ));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = String::from("guardrail validation failed:");
+    for failure in failures {
+        write!(message, "\n  - {failure}")?;
+    }
+    bail!(message)
+}
+
+fn validate_check(root: &Path, check: &Check) -> std::result::Result<(), String> {
+    match check {
+        Check::PackageScript { manifest, script } => {
+            let canonical = canonicalize_checked_path(root, manifest, "package manifest")?;
+            if !canonical.is_file() {
+                return Err(format!(
+                    "package manifest {} is not a file",
+                    manifest.display()
+                ));
+            }
+            let text = fs::read_to_string(&canonical).map_err(|error| {
+                format!(
+                    "failed to read package manifest {}: {error}",
+                    manifest.display()
+                )
+            })?;
+            let package: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+                format!(
+                    "failed to parse package manifest {} as JSON: {error}",
+                    manifest.display()
+                )
+            })?;
+            let scripts = package
+                .get("scripts")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "package manifest {} does not define a scripts object",
+                        manifest.display()
+                    )
+                })?;
+            let Some(command) = scripts.get(script) else {
+                return Err(format!(
+                    "script {script:?} does not exist in package manifest {}",
+                    manifest.display()
+                ));
+            };
+            if !command.is_string() {
+                return Err(format!(
+                    "script {script:?} in package manifest {} must be a string",
+                    manifest.display()
+                ));
+            }
+            Ok(())
+        }
+        Check::PathExists { path, kind } => {
+            let canonical = canonicalize_checked_path(root, path, "required path")?;
+            let valid_kind = match kind {
+                PathKind::Any => true,
+                PathKind::File => canonical.is_file(),
+                PathKind::Directory => canonical.is_dir(),
+            };
+            if valid_kind {
+                Ok(())
+            } else {
+                Err(format!(
+                    "required path {} is not a {}",
+                    path.display(),
+                    path_kind_name(*kind)
+                ))
+            }
+        }
+    }
+}
+
+fn canonicalize_checked_path(
+    root: &Path,
+    relative: &Path,
+    kind: &str,
+) -> std::result::Result<PathBuf, String> {
+    let path = root.join(relative);
+    let canonical = path.canonicalize().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("{kind} {} does not exist", relative.display())
+        } else {
+            format!("failed to resolve {kind} {}: {error}", relative.display())
+        }
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "{kind} {} resolves outside the project root",
+            relative.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn describe_check(check: &Check) -> String {
+    match check {
+        Check::PackageScript { manifest, script } => format!(
+            "package-script check ({}#scripts.{script})",
+            manifest.display()
+        ),
+        Check::PathExists { path, kind } => format!(
+            "path-exists check ({}; kind {})",
+            path.display(),
+            path_kind_name(*kind)
+        ),
+    }
+}
+
+fn path_kind_name(kind: PathKind) -> &'static str {
+    match kind {
+        PathKind::Any => "any",
+        PathKind::File => "file",
+        PathKind::Directory => "directory",
+    }
 }
 
 fn render_output(project: &Project, output: &Output, rules: &[&Rule], fingerprint: &str) -> String {

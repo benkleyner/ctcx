@@ -110,6 +110,193 @@ fn equal_priority_slot_conflicts_are_errors() -> Result<()> {
 }
 
 #[test]
+fn validates_package_scripts_and_root_relative_paths_from_imported_rules() -> Result<()> {
+    let (temp, config) = fixture();
+    write(
+        &temp.path().join("package.json"),
+        r#"{"scripts":{"test":"cargo test"}}"#,
+    );
+    write(&temp.path().join("scripts/setup.sh"), "#!/bin/sh\n");
+    fs::create_dir(temp.path().join("fixtures"))?;
+    let fragment = temp.path().join("context/common.yaml");
+    let mut text = fs::read_to_string(&fragment)?;
+    text.push_str(
+        r#"    checks:
+      - type: package-script
+        manifest: package.json
+        script: test
+      - type: path-exists
+        path: scripts/setup.sh
+        kind: file
+      - type: path-exists
+        path: fixtures
+        kind: directory
+      - type: path-exists
+        path: package.json
+"#,
+    );
+    write(&fragment, &text);
+
+    let project = load_project(&config)?;
+    let compiled = compile_project(&project)?;
+    assert_eq!(compiled.outputs.len(), 2);
+    assert_eq!(project.dependencies.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn aggregates_guardrail_failures_across_every_effective_target() -> Result<()> {
+    let (temp, config) = fixture();
+    write(&temp.path().join("package.json"), r#"{"scripts":{}}"#);
+    write(&temp.path().join("not-a-directory"), "file\n");
+    let fragment = temp.path().join("context/common.yaml");
+    let mut text = fs::read_to_string(&fragment)?;
+    text.push_str(
+        r#"    checks:
+      - type: package-script
+        manifest: package.json
+        script: test
+      - type: path-exists
+        path: scripts/missing.sh
+        kind: file
+      - type: path-exists
+        path: not-a-directory
+        kind: directory
+"#,
+    );
+    write(&fragment, &text);
+
+    let project = load_project(&config)?;
+    let error = compile_project(&project).unwrap_err().to_string();
+    assert!(error.starts_with("guardrail validation failed:"));
+    assert!(error.contains("rule test-guide (context/common.yaml)"));
+    assert_eq!(error.matches("targets [agents, claude]").count(), 3);
+    assert!(error.contains("script \"test\" does not exist"));
+    assert!(error.contains("required path scripts/missing.sh does not exist"));
+    assert!(error.contains("required path not-a-directory is not a directory"));
+    Ok(())
+}
+
+#[test]
+fn skips_checks_for_targets_where_the_rule_is_suppressed() -> Result<()> {
+    let (temp, config) = fixture();
+    write(&temp.path().join("package.json"), r#"{"scripts":{}}"#);
+    let text = fs::read_to_string(&config)?.replace(
+        "      inline: Use Cargo by default.\n",
+        r#"      inline: Use Cargo by default.
+    checks:
+      - type: package-script
+        manifest: package.json
+        script: missing
+"#,
+    );
+    write(&config, &text);
+
+    let project = load_project(&config)?;
+    let error = compile_project(&project).unwrap_err().to_string();
+    assert!(error.contains("rule default-package-manager"));
+    assert!(error.contains("targets [agents]"));
+    assert!(!error.contains("targets [agents, claude]"));
+    assert!(!error.contains("targets [claude]"));
+    Ok(())
+}
+
+#[test]
+fn rejects_malformed_or_invalid_package_manifests() -> Result<()> {
+    let (temp, config) = fixture();
+    let fragment = temp.path().join("context/common.yaml");
+    let mut text = fs::read_to_string(&fragment)?;
+    text.push_str(
+        r#"    checks:
+      - type: package-script
+        manifest: package.json
+        script: test
+"#,
+    );
+    write(&fragment, &text);
+
+    write(&temp.path().join("package.json"), "not json\n");
+    let project = load_project(&config)?;
+    assert!(
+        compile_project(&project)
+            .unwrap_err()
+            .to_string()
+            .contains("failed to parse package manifest package.json as JSON")
+    );
+
+    write(&temp.path().join("package.json"), "{}\n");
+    assert!(
+        compile_project(&project)
+            .unwrap_err()
+            .to_string()
+            .contains("does not define a scripts object")
+    );
+
+    write(
+        &temp.path().join("package.json"),
+        r#"{"scripts":{"test":42}}"#,
+    );
+    assert!(
+        compile_project(&project)
+            .unwrap_err()
+            .to_string()
+            .contains("script \"test\" in package manifest package.json must be a string")
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_guardrail_paths_that_escape_the_project_root() -> Result<()> {
+    let (temp, config) = fixture();
+    let fragment = temp.path().join("context/common.yaml");
+    let mut text = fs::read_to_string(&fragment)?;
+    text.push_str(
+        r#"    checks:
+      - type: path-exists
+        path: ../outside
+"#,
+    );
+    write(&fragment, &text);
+    let error = format!("{:#}", load_project(&config).unwrap_err());
+    assert!(error.contains("invalid path-exists path"));
+    assert!(error.contains("escapes the project root"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_guardrail_symlinks_that_escape_the_project_root() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let (temp, config) = fixture();
+    let outside = tempfile::tempdir()?;
+    write(&outside.path().join("setup.sh"), "#!/bin/sh\n");
+    symlink(
+        outside.path().join("setup.sh"),
+        temp.path().join("setup.sh"),
+    )?;
+    let fragment = temp.path().join("context/common.yaml");
+    let mut text = fs::read_to_string(&fragment)?;
+    text.push_str(
+        r#"    checks:
+      - type: path-exists
+        path: setup.sh
+        kind: file
+"#,
+    );
+    write(&fragment, &text);
+
+    let project = load_project(&config)?;
+    assert!(
+        compile_project(&project)
+            .unwrap_err()
+            .to_string()
+            .contains("required path setup.sh resolves outside the project root")
+    );
+    Ok(())
+}
+
+#[test]
 fn reports_complete_import_cycles() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("ctcx.yaml");

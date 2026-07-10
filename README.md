@@ -87,6 +87,32 @@ rules: []
 
 All imports are local, resolved relative to the YAML file that declares them, and confined to the project root. `ctcx` reports the full path when it detects an import cycle.
 
+## Guardrail checks
+
+Rules can declare explicit checks for project state referenced by their instructions:
+
+```yaml
+rules:
+  - id: test-workflow
+    targets: [agents, claude]
+    section: testing
+    content:
+      inline: Run `bun test` before submitting changes.
+    checks:
+      - type: package-script
+        manifest: package.json
+        script: test
+      - type: path-exists
+        path: scripts/setup.sh
+        kind: file
+```
+
+Check paths are relative to the project root, including checks declared in imported fragments. A `package-script` check requires a JSON package manifest with a string-valued entry in its `scripts` object. A `path-exists` check accepts `kind: any`, `file`, or `directory`; the default is `any`. Absolute paths, paths that escape the project root, and symlinks that resolve outside it are rejected.
+
+Checks run after rule precedence is resolved. Each check must pass for every target where its rule is effective; checks on suppressed rules do not run for that target. Failures from all effective rules and targets are reported together. Checked project files are revalidated by each command but are not added to the generated manifest because their contents do not affect the rendered Markdown.
+
+Checks are explicit contracts. `ctcx` does not infer commands from Markdown or validate arbitrary executables, shell syntax, Cargo targets, Make targets, or runtime `PATH` availability. Bun, npm, pnpm, and Yarn scripts all use the same package-manifest check.
+
 ## Rule precedence
 
 Rules are additive by default. Rules become mutually exclusive when they use the same `slot` for the same target. The highest numeric `priority` wins; a tie is a validation error.
