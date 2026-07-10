@@ -86,3 +86,42 @@ fn cli_returns_failure_for_drift_and_prints_a_diff() {
         .failure()
         .stdout(predicate::str::contains("--- a/AGENTS.md"));
 }
+
+#[test]
+fn cli_validate_reports_aggregated_guardrail_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("ctcx.yaml");
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args(["--config", config.to_str().unwrap(), "init"])
+        .assert()
+        .success();
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        r#"    checks:
+      - type: package-script
+        manifest: package.json
+        script: test
+      - type: path-exists
+        path: scripts/setup.sh
+        kind: file
+"#,
+    );
+    std::fs::write(&config, text).unwrap();
+
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args(["--config", config.to_str().unwrap(), "validate"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("guardrail validation failed:")
+                .and(predicate::str::contains("targets [agents, claude]"))
+                .and(predicate::str::contains(
+                    "package manifest package.json does not exist",
+                ))
+                .and(predicate::str::contains(
+                    "required path scripts/setup.sh does not exist",
+                )),
+        );
+}

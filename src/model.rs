@@ -67,6 +67,31 @@ pub struct RawRule {
     #[serde(default = "default_order")]
     pub order: i32,
     pub content: RawContent,
+    #[serde(default)]
+    pub checks: Vec<RawCheck>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RawCheck {
+    PackageScript {
+        manifest: PathBuf,
+        script: String,
+    },
+    PathExists {
+        path: PathBuf,
+        #[serde(default)]
+        kind: RawPathKind,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawPathKind {
+    #[default]
+    Any,
+    File,
+    Directory,
 }
 
 #[derive(Debug, Clone, Deserialize)]
