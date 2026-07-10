@@ -1132,7 +1132,7 @@ fn source_fingerprint(project: &Project) -> String {
         hasher.update(dependency.relative_path.as_bytes());
         hasher.update([0]);
         hasher.update(dependency.sha256.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(b"\n");
     }
     hex::encode(hasher.finalize())
 }
