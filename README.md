@@ -11,6 +11,12 @@
 cargo install --path .
 ```
 
+Or install the latest release with Homebrew:
+
+```bash
+brew install benkleyner/tap/ctcx
+```
+
 Initialize a project and verify the generated files:
 
 ```bash
