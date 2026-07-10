@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Usage and design questions
+    url: https://github.com/benkleyner/ctcx/discussions
+    about: Ask questions and discuss ideas before filing an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/benkleyner/ctcx/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.
