@@ -1,0 +1,4 @@
+interface:
+  display_name: "ctcx Context"
+  short_description: "Compile and maintain agent instructions"
+  default_prompt: "Use $ctcx-context to migrate this repository's agent instructions into ctcx."
