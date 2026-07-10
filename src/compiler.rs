@@ -1,9 +1,11 @@
 use crate::model::{
     MANIFEST_VERSION, Manifest, ManifestDependency, ManifestOutput, ManifestSuppressed, RawCheck,
-    RawCondition, RawDocument, RawPathKind, RawRule, SCHEMA_VERSION,
+    RawCondition, RawDocument, RawHeaderMode, RawOutputFormat, RawPathKind, RawRule, RawTemplate,
+    SCHEMA_VERSION,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
+use serde_yaml_ng::Value;
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::collections::{BTreeMap, HashSet};
@@ -32,6 +34,56 @@ pub struct Output {
     pub path: PathBuf,
     pub relative_path: PathBuf,
     pub title: String,
+    pub format: OutputFormat,
+    pub front_matter: BTreeMap<String, Value>,
+    pub header: Header,
+    pub templates: OutputTemplates,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Markdown,
+    Agents,
+    Claude,
+    Cursor,
+    Copilot,
+    Windsurf,
+    Cline,
+    Template,
+}
+
+impl OutputFormat {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Agents => "agents",
+            Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Copilot => "copilot",
+            Self::Windsurf => "windsurf",
+            Self::Cline => "cline",
+            Self::Template => "template",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Header {
+    Default,
+    Omit,
+    Template(Template),
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct OutputTemplates {
+    pub output: Option<Template>,
+    pub section: Option<Template>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Template {
+    pub content: String,
+    pub source: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +382,56 @@ impl Loader {
             let path = self.root.join(&relative_path);
             ensure_output_location(&self.root, &path)
                 .with_context(|| format!("invalid path for output {name}"))?;
+            let format = output_format(raw.format);
+            validate_output_format(name, format, &relative_path, &raw.front_matter)?;
+            let templates = OutputTemplates {
+                output: raw
+                    .templates
+                    .output
+                    .as_ref()
+                    .map(|template| self.resolve_template(template, "output template", name))
+                    .transpose()?,
+                section: raw
+                    .templates
+                    .section
+                    .as_ref()
+                    .map(|template| self.resolve_template(template, "section template", name))
+                    .transpose()?,
+            };
+            ensure!(
+                format != OutputFormat::Template || templates.output.is_some(),
+                "template output {name} must define templates.output"
+            );
+            ensure!(
+                format != OutputFormat::Template || templates.section.is_some(),
+                "template output {name} must define templates.section"
+            );
+            let header = match raw.header.as_ref() {
+                None => Header::Default,
+                Some(header) => match header.mode {
+                    RawHeaderMode::Default => {
+                        ensure!(
+                            header.template.is_none(),
+                            "output {name} header.template is only valid when header.mode is template"
+                        );
+                        Header::Default
+                    }
+                    RawHeaderMode::Omit => {
+                        ensure!(
+                            header.template.is_none(),
+                            "output {name} header.template is only valid when header.mode is template"
+                        );
+                        Header::Omit
+                    }
+                    RawHeaderMode::Template => Header::Template(self.resolve_template(
+                        header.template.as_ref().context(format!(
+                            "output {name} header.mode template requires header.template"
+                        ))?,
+                        "header template",
+                        name,
+                    )?),
+                },
+            };
             if let Some(existing) = output_paths.insert(relative_path.clone(), name.clone()) {
                 bail!(
                     "outputs {existing} and {name} both write {}",
@@ -343,6 +445,10 @@ impl Loader {
                     path,
                     relative_path,
                     title: raw.title.clone(),
+                    format,
+                    front_matter: raw.front_matter.clone(),
+                    header,
+                    templates,
                 },
             );
         }
@@ -535,6 +641,54 @@ impl Loader {
             checks,
         })
     }
+
+    fn resolve_template(
+        &mut self,
+        raw: &RawTemplate,
+        kind: &str,
+        output: &str,
+    ) -> Result<Template> {
+        let (content, source) = match (&raw.inline, &raw.file) {
+            (Some(inline), None) => (normalize_template(inline), None),
+            (None, Some(file)) => {
+                ensure!(
+                    !file.is_absolute(),
+                    "{kind} file for output {output} must be relative"
+                );
+                let source_directory = self
+                    .config_path
+                    .parent()
+                    .context("configuration path has no parent directory")?;
+                let canonical = source_directory
+                    .join(file)
+                    .canonicalize()
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve {kind} file {} for output {output}",
+                            file.display()
+                        )
+                    })?;
+                ensure_inside(&self.root, &canonical, kind)?;
+                let bytes = fs::read(&canonical).with_context(|| {
+                    format!("failed to read {kind} file {}", canonical.display())
+                })?;
+                let text = String::from_utf8(bytes.clone()).map_err(|_| {
+                    anyhow!("{kind} file {} is not valid UTF-8", canonical.display())
+                })?;
+                self.add_dependency(&canonical, &bytes)?;
+                (normalize_template(&text), Some(canonical))
+            }
+            (Some(_), Some(_)) => {
+                bail!("{kind} for output {output} must define only one of inline or file")
+            }
+            (None, None) => bail!("{kind} for output {output} must define one of inline or file"),
+        };
+        ensure!(
+            !content.trim().is_empty(),
+            "{kind} for output {output} may not be empty"
+        );
+        Ok(Template { content, source })
+    }
 }
 
 fn resolve_condition(raw: &RawCondition) -> Result<Condition> {
@@ -602,6 +756,157 @@ fn resolve_check(raw: &RawCheck) -> Result<Check> {
     }
 }
 
+fn output_format(raw: RawOutputFormat) -> OutputFormat {
+    match raw {
+        RawOutputFormat::Markdown => OutputFormat::Markdown,
+        RawOutputFormat::Agents => OutputFormat::Agents,
+        RawOutputFormat::Claude => OutputFormat::Claude,
+        RawOutputFormat::Cursor => OutputFormat::Cursor,
+        RawOutputFormat::Copilot => OutputFormat::Copilot,
+        RawOutputFormat::Windsurf => OutputFormat::Windsurf,
+        RawOutputFormat::Cline => OutputFormat::Cline,
+        RawOutputFormat::Template => OutputFormat::Template,
+    }
+}
+
+fn validate_output_format(
+    name: &str,
+    format: OutputFormat,
+    path: &Path,
+    front_matter: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let has_prefix = |prefix: &str| path.starts_with(Path::new(prefix));
+    let has_extension = |extension: &str| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+    };
+
+    match format {
+        OutputFormat::Markdown | OutputFormat::Template => {}
+        OutputFormat::Agents => ensure!(
+            file_name == "AGENTS.md",
+            "agents output {name} must write an AGENTS.md file"
+        ),
+        OutputFormat::Claude => ensure!(
+            file_name == "CLAUDE.md",
+            "claude output {name} must write a CLAUDE.md file"
+        ),
+        OutputFormat::Cursor => ensure!(
+            has_prefix(".cursor/rules") && path.components().count() > 2 && has_extension("mdc"),
+            "cursor output {name} must write .cursor/rules/**/*.mdc"
+        ),
+        OutputFormat::Copilot => ensure!(
+            path == Path::new(".github/copilot-instructions.md")
+                || (has_prefix(".github/instructions")
+                    && path.components().count() > 2
+                    && file_name.ends_with(".instructions.md")),
+            "copilot output {name} must write .github/copilot-instructions.md or .github/instructions/**/*.instructions.md"
+        ),
+        OutputFormat::Windsurf => ensure!(
+            has_prefix(".windsurf/rules") && path.components().count() > 2 && has_extension("md"),
+            "windsurf output {name} must write .windsurf/rules/**/*.md"
+        ),
+        OutputFormat::Cline => ensure!(
+            has_prefix(".clinerules")
+                && path.components().count() > 1
+                && (has_extension("md") || has_extension("txt")),
+            "cline output {name} must write .clinerules/**/*.md or .clinerules/**/*.txt"
+        ),
+    }
+
+    validate_front_matter(name, format, path, front_matter)
+}
+
+fn validate_front_matter(
+    output: &str,
+    format: OutputFormat,
+    path: &Path,
+    front_matter: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let value = |key: &str| front_matter.get(key);
+    match format {
+        OutputFormat::Cursor => {
+            if let Some(item) = value("description") {
+                ensure_yaml_string(item, output, "description")?;
+            }
+            if let Some(item) = value("globs") {
+                ensure_yaml_string_or_strings(item, output, "globs")?;
+            }
+            if let Some(item) = value("alwaysApply") {
+                ensure!(
+                    matches!(item, Value::Bool(_)),
+                    "cursor output {output} front_matter.alwaysApply must be a boolean"
+                );
+            }
+        }
+        OutputFormat::Copilot if path != Path::new(".github/copilot-instructions.md") => {
+            let apply_to = value("applyTo").context(format!(
+                "path-specific copilot output {output} requires front_matter.applyTo"
+            ))?;
+            ensure_yaml_string(apply_to, output, "applyTo")?;
+        }
+        OutputFormat::Windsurf => {
+            let trigger = value("trigger").context(format!(
+                "windsurf output {output} requires front_matter.trigger"
+            ))?;
+            let trigger = ensure_yaml_string(trigger, output, "trigger")?;
+            ensure!(
+                matches!(trigger, "always_on" | "glob" | "model_decision" | "manual"),
+                "windsurf output {output} front_matter.trigger must be always_on, glob, model_decision, or manual"
+            );
+            if trigger == "glob" {
+                let globs = value("globs").context(format!(
+                    "windsurf glob output {output} requires front_matter.globs"
+                ))?;
+                ensure_yaml_string_or_strings(globs, output, "globs")?;
+            }
+            if trigger == "model_decision" {
+                let description = value("description").context(format!(
+                    "windsurf model_decision output {output} requires front_matter.description"
+                ))?;
+                ensure_yaml_string(description, output, "description")?;
+            }
+        }
+        OutputFormat::Cline => {
+            if let Some(item) = value("paths") {
+                ensure_yaml_string_or_strings(item, output, "paths")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn ensure_yaml_string<'a>(value: &'a Value, output: &str, key: &str) -> Result<&'a str> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Ok(value),
+        Value::String(_) => bail!("output {output} front_matter.{key} may not be empty"),
+        _ => bail!("output {output} front_matter.{key} must be a non-empty string"),
+    }
+}
+
+fn ensure_yaml_string_or_strings(value: &Value, output: &str, key: &str) -> Result<()> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Ok(()),
+        Value::Sequence(values)
+            if !values.is_empty()
+                && values.iter().all(
+                    |item| matches!(item, Value::String(value) if !value.trim().is_empty()),
+                ) =>
+        {
+            Ok(())
+        }
+        _ => bail!(
+            "output {output} front_matter.{key} must be a non-empty string or list of non-empty strings"
+        ),
+    }
+}
+
 pub fn compile_project(project: &Project) -> Result<CompiledProject> {
     let condition_results = project
         .rules
@@ -621,6 +926,7 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
     let mut effective_checks = BTreeMap::<(&str, usize), Vec<String>>::new();
 
     for (target, output) in &project.outputs {
+        validate_templates(project, output, &source_fingerprint)?;
         let applicable = project
             .rules
             .iter()
@@ -723,7 +1029,7 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
             }
         }
 
-        let content = render_output(project, output, &selected, &source_fingerprint);
+        let content = render_output(project, output, &selected, &source_fingerprint)?;
         let applied = selected
             .iter()
             .map(|rule| rule.id.clone())
@@ -977,22 +1283,264 @@ fn path_kind_name(kind: PathKind) -> &'static str {
     }
 }
 
-fn render_output(project: &Project, output: &Output, rules: &[&Rule], fingerprint: &str) -> String {
-    let config = display_relative(&project.root, &project.config_path);
-    let mut rendered = format!(
-        "<!-- Generated by ctcx from {config}. DO NOT EDIT. Fingerprint: {fingerprint} -->\n\n# {}\n",
-        output.title.trim()
-    );
+fn render_output(
+    project: &Project,
+    output: &Output,
+    rules: &[&Rule],
+    fingerprint: &str,
+) -> Result<String> {
+    let front_matter = render_front_matter(&output.front_matter)?;
+    let mut context = output_template_context(project, output, fingerprint, &front_matter, "");
+    let generated_header = match &output.header {
+        Header::Default => generated_header(project, fingerprint),
+        Header::Omit => String::new(),
+        Header::Template(template) => render_template(template, &context)?,
+    };
+
+    let mut rendered_sections = Vec::new();
     let mut current_section: Option<&str> = None;
+    let mut current_content = Vec::new();
     for rule in rules {
         if current_section != Some(rule.section.as_str()) {
-            let section = &project.sections[&rule.section];
-            write!(rendered, "\n## {}\n", section.title.trim()).unwrap();
+            if let Some(section_id) = current_section {
+                rendered_sections.push(render_section(
+                    project,
+                    output,
+                    &project.sections[section_id],
+                    &current_content.join("\n\n"),
+                    fingerprint,
+                    &front_matter,
+                    &generated_header,
+                )?);
+                current_content.clear();
+            }
             current_section = Some(&rule.section);
         }
-        write!(rendered, "\n{}\n", rule.content.trim_end()).unwrap();
+        current_content.push(rule.content.trim_end().to_owned());
     }
-    rendered
+    if let Some(section_id) = current_section {
+        rendered_sections.push(render_section(
+            project,
+            output,
+            &project.sections[section_id],
+            &current_content.join("\n\n"),
+            fingerprint,
+            &front_matter,
+            &generated_header,
+        )?);
+    }
+    let sections = rendered_sections.join("\n\n");
+    context.insert("generated_header", generated_header.clone());
+    context.insert("sections", sections.clone());
+
+    let rendered = match &output.templates.output {
+        Some(template) => {
+            let (rendered, placeholders) = render_template_with_placeholders(template, &context)?;
+            assert_required_placeholder(&placeholders, "sections", "output template")?;
+            rendered
+        }
+        None => default_output(&front_matter, &generated_header, &output.title, &sections),
+    };
+    Ok(normalize_output(&rendered))
+}
+
+fn validate_templates(project: &Project, output: &Output, fingerprint: &str) -> Result<()> {
+    let front_matter = render_front_matter(&output.front_matter)?;
+    let mut context = output_template_context(project, output, fingerprint, &front_matter, "");
+    let header = match &output.header {
+        Header::Default => generated_header(project, fingerprint),
+        Header::Omit => String::new(),
+        Header::Template(template) => render_template(template, &context)?,
+    };
+    if let Some(template) = &output.templates.output {
+        let (_, placeholders) = render_template_with_placeholders(template, &context)?;
+        assert_required_placeholder(&placeholders, "sections", "output template")?;
+    }
+    if let Some(template) = &output.templates.section {
+        let section = project
+            .sections
+            .values()
+            .next()
+            .context("project has no sections")?;
+        context.insert("generated_header", header);
+        context.insert("content", "template validation".to_owned());
+        context.insert("section_id", section.id.clone());
+        context.insert("section_title", section.title.trim().to_owned());
+        context.insert("section_order", section.order.to_string());
+        let (_, placeholders) = render_template_with_placeholders(template, &context)?;
+        assert_required_placeholder(&placeholders, "content", "section template")?;
+    }
+    Ok(())
+}
+
+fn render_section(
+    project: &Project,
+    output: &Output,
+    section: &Section,
+    content: &str,
+    fingerprint: &str,
+    front_matter: &str,
+    generated_header: &str,
+) -> Result<String> {
+    let mut context =
+        output_template_context(project, output, fingerprint, front_matter, generated_header);
+    context.insert("content", content.to_owned());
+    context.insert("section_id", section.id.clone());
+    context.insert("section_title", section.title.trim().to_owned());
+    context.insert("section_order", section.order.to_string());
+    match &output.templates.section {
+        Some(template) => {
+            let (rendered, placeholders) = render_template_with_placeholders(template, &context)?;
+            assert_required_placeholder(&placeholders, "content", "section template")?;
+            Ok(rendered)
+        }
+        None => Ok(format!("## {}\n\n{content}", section.title.trim())),
+    }
+}
+
+fn output_template_context(
+    project: &Project,
+    output: &Output,
+    fingerprint: &str,
+    front_matter: &str,
+    generated_header: &str,
+) -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        ("project_name", project.name.clone()),
+        ("output_name", output.name.clone()),
+        ("output_path", path_string(&output.relative_path)),
+        ("title", output.title.trim().to_owned()),
+        ("renderer", output.format.name().to_owned()),
+        ("fingerprint", fingerprint.to_owned()),
+        ("front_matter", front_matter.to_owned()),
+        ("generated_header", generated_header.to_owned()),
+        ("sections", String::new()),
+    ])
+}
+
+fn render_template(template: &Template, context: &BTreeMap<&str, String>) -> Result<String> {
+    Ok(render_template_with_placeholders(template, context)?.0)
+}
+
+fn render_template_with_placeholders(
+    template: &Template,
+    context: &BTreeMap<&str, String>,
+) -> Result<(String, BTreeMap<String, usize>)> {
+    let mut rendered = String::new();
+    let mut remaining = template.content.as_str();
+    let mut placeholders = BTreeMap::new();
+    while let Some(start) = remaining.find("{{") {
+        let (prefix, after_open) = remaining.split_at(start);
+        rendered.push_str(prefix);
+        let after_open = &after_open[2..];
+        let end = after_open
+            .find("}}")
+            .context("template has an unclosed {{ placeholder")?;
+        let (name, after_close) = after_open.split_at(end);
+        let name = name.trim();
+        ensure!(!name.is_empty(), "template contains an empty placeholder");
+        ensure!(
+            name.chars()
+                .all(|character| character.is_ascii_lowercase() || character == '_'),
+            "template placeholder {name:?} must use lowercase letters and underscores"
+        );
+        let value = context
+            .get(name)
+            .with_context(|| format!("template references unknown placeholder {name:?}"))?;
+        rendered.push_str(value);
+        *placeholders.entry(name.to_owned()).or_insert(0) += 1;
+        remaining = &after_close[2..];
+    }
+    ensure!(
+        !remaining.contains("}}"),
+        "template has an unmatched }} delimiter"
+    );
+    rendered.push_str(remaining);
+    Ok((rendered, placeholders))
+}
+
+fn assert_required_placeholder(
+    placeholders: &BTreeMap<String, usize>,
+    required: &str,
+    kind: &str,
+) -> Result<()> {
+    ensure!(
+        placeholders.get(required) == Some(&1),
+        "{kind} must contain exactly one {{{{{required}}}}} placeholder"
+    );
+    Ok(())
+}
+
+fn render_front_matter(front_matter: &BTreeMap<String, Value>) -> Result<String> {
+    if front_matter.is_empty() {
+        return Ok(String::new());
+    }
+    let front_matter = front_matter
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), canonicalize_yaml_value(value)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let body =
+        serde_yaml_ng::to_string(&front_matter).context("failed to serialize front matter")?;
+    Ok(format!(
+        "---\n{}\n---",
+        normalize_template(&body).trim_end()
+    ))
+}
+
+fn canonicalize_yaml_value(value: &Value) -> Result<Value> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(value.clone()),
+        Value::Sequence(items) => items
+            .iter()
+            .map(canonicalize_yaml_value)
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Sequence),
+        Value::Mapping(mapping) => {
+            let mut entries = mapping
+                .iter()
+                .map(|(key, value)| {
+                    let key = canonicalize_yaml_value(key)?;
+                    let ordering = serde_yaml_ng::to_string(&key)
+                        .context("failed to serialize a front matter mapping key")?;
+                    Ok((ordering, key, canonicalize_yaml_value(value)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_yaml_ng::Mapping::new();
+            for (_, key, value) in entries {
+                canonical.insert(key, value);
+            }
+            Ok(Value::Mapping(canonical))
+        }
+        Value::Tagged(tagged) => Ok(Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: tagged.tag.clone(),
+            value: canonicalize_yaml_value(&tagged.value)?,
+        }))),
+    }
+}
+
+fn generated_header(project: &Project, fingerprint: &str) -> String {
+    let config = display_relative(&project.root, &project.config_path);
+    format!("<!-- Generated by ctcx from {config}. DO NOT EDIT. Fingerprint: {fingerprint} -->")
+}
+
+fn default_output(front_matter: &str, header: &str, title: &str, sections: &str) -> String {
+    let mut parts = Vec::new();
+    if !front_matter.is_empty() {
+        parts.push(front_matter.to_owned());
+    }
+    if !header.is_empty() {
+        parts.push(header.to_owned());
+    }
+    parts.push(format!("# {}", title.trim()));
+    if !sections.is_empty() {
+        parts.push(sections.to_owned());
+    }
+    parts.join("\n\n")
+}
+
+fn normalize_output(output: &str) -> String {
+    format!("{}\n", normalize_template(output).trim_end())
 }
 
 pub fn build_project(
@@ -1404,7 +1952,7 @@ pub fn init_project(config_path: &Path, force: bool) -> Result<Vec<PathBuf>> {
         .unwrap_or("project");
     let project_scalar = serde_yaml_ng::to_string(project_name)?.trim().to_owned();
     let config = format!(
-        "version: 1\n\nproject:\n  name: {project_scalar}\n\noutputs:\n  agents:\n    path: AGENTS.md\n    title: Project Agent Instructions\n  claude:\n    path: CLAUDE.md\n    title: Claude Code Instructions\n\nsections:\n  - id: workflow\n    title: Workflow\n    order: 100\n\nrules:\n  - id: project-workflow\n    priority: 0\n    targets: [\"*\"]\n    section: workflow\n    order: 100\n    content:\n      file: instructions/project.md\n"
+        "version: 1\n\nproject:\n  name: {project_scalar}\n\noutputs:\n  agents:\n    path: AGENTS.md\n    title: Project Agent Instructions\n    format: agents\n  claude:\n    path: CLAUDE.md\n    title: Claude Code Instructions\n    format: claude\n\nsections:\n  - id: workflow\n    title: Workflow\n    order: 100\n\nrules:\n  - id: project-workflow\n    priority: 0\n    targets: [\"*\"]\n    section: workflow\n    order: 100\n    content:\n      file: instructions/project.md\n"
     );
     let instruction =
         "Describe the commands, constraints, and workflow agents must follow in this project.\n";
@@ -1495,6 +2043,10 @@ fn normalize_markdown(content: &str) -> String {
         .replace('\r', "\n")
         .trim_end()
         .to_owned()
+}
+
+fn normalize_template(content: &str) -> String {
+    content.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn ensure_yaml_extension(path: &Path, kind: &str) -> Result<()> {

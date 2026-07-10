@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_yaml_ng::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -43,6 +44,64 @@ pub struct RawImport {
 pub struct RawOutput {
     pub path: PathBuf,
     pub title: String,
+    #[serde(default)]
+    pub format: RawOutputFormat,
+    #[serde(default)]
+    pub front_matter: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub header: Option<RawHeader>,
+    #[serde(default)]
+    pub templates: RawTemplates,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawOutputFormat {
+    #[default]
+    Markdown,
+    Agents,
+    Claude,
+    Cursor,
+    Copilot,
+    Windsurf,
+    Cline,
+    Template,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawHeader {
+    #[serde(default)]
+    pub mode: RawHeaderMode,
+    #[serde(default)]
+    pub template: Option<RawTemplate>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawHeaderMode {
+    #[default]
+    Default,
+    Omit,
+    Template,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawTemplates {
+    #[serde(default)]
+    pub output: Option<RawTemplate>,
+    #[serde(default)]
+    pub section: Option<RawTemplate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawTemplate {
+    #[serde(default)]
+    pub inline: Option<String>,
+    #[serde(default)]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
