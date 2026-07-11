@@ -147,6 +147,8 @@ ctcx diff                    # inspect expected changes
 ctcx build                   # write generated outputs and manifest
 ctcx check                   # ensure nothing is stale or hand-edited
 ctcx explain --target agents # inspect rule provenance
+ctcx graph --format json      # inspect the versioned dependency graph
+ctcx why AGENTS.md --line 42  # trace a generated line to its source
 ```
 
 `build` protects untracked and manually edited output files. Use `--force` only after reviewing the migration diff. `check` detects missing, stale, modified, and obsolete generated state.

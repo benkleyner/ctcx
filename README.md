@@ -227,6 +227,23 @@ ctcx explain --target claude --slot tooling.package-manager
 ctcx explain --rule default-package-manager
 ```
 
+## Dependency graph and provenance
+
+Inspect imports, content and template files, outputs, effective rules, condition-false rules,
+and suppressions with `ctcx graph`. Text is the default; DOT is suitable for Graphviz; JSON is a
+stable deterministic contract with `schema_version: 1`.
+
+```bash
+ctcx graph
+ctcx graph --format dot > ctcx.dot
+ctcx graph --format json > ctcx-graph.json
+ctcx why AGENTS.md --line 42
+```
+
+`why` uses the expected in-memory compilation, even when the destination is missing or stale. It
+reports the output, section, effective rule, YAML declaration, and exact file-backed content line.
+Generated wrappers report output provenance without inventing a rule.
+
 ## Commands
 
 | Command | Purpose |
@@ -238,6 +255,8 @@ ctcx explain --rule default-package-manager
 | `ctcx check` | Fail when generated state is missing, stale, modified, or obsolete. |
 | `ctcx diff` | Print unified differences without writing files. |
 | `ctcx explain` | Show rule provenance and precedence decisions. |
+| `ctcx graph` | Show dependencies and rule selection as text, DOT, or JSON. |
+| `ctcx why` | Map an expected generated line back to its source. |
 
 `build` refuses to overwrite manually edited or untracked destinations. Use `--force` only when those edits should be replaced. `build --dry-run` reports what would change.
 

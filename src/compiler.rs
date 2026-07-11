@@ -4,7 +4,7 @@ use crate::model::{
     SCHEMA_VERSION,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
@@ -26,6 +26,27 @@ pub struct Project {
     pub sections: BTreeMap<String, Section>,
     pub rules: Vec<Rule>,
     pub dependencies: BTreeMap<String, Dependency>,
+    pub documents: Vec<SourceDocument>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceLocation {
+    pub path: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceDocument {
+    pub path: PathBuf,
+    pub imports: Vec<SourceImport>,
+    pub location: SourceLocation,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceImport {
+    pub path: PathBuf,
+    pub location: SourceLocation,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +59,7 @@ pub struct Output {
     pub front_matter: BTreeMap<String, Value>,
     pub header: Header,
     pub templates: OutputTemplates,
+    pub location: SourceLocation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +106,8 @@ pub struct OutputTemplates {
 pub struct Template {
     pub content: String,
     pub source: Option<PathBuf>,
+    pub location: SourceLocation,
+    pub source_locations: Vec<SourceLocation>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +116,7 @@ pub struct Section {
     pub title: String,
     pub order: i32,
     pub source: PathBuf,
+    pub location: SourceLocation,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +130,8 @@ pub struct Rule {
     pub content: String,
     pub source: PathBuf,
     pub content_source: Option<PathBuf>,
+    pub location: SourceLocation,
+    pub content_location: SourceLocation,
     pub when: Option<Condition>,
     pub checks: Vec<Check>,
 }
@@ -154,6 +181,26 @@ pub struct CompiledOutput {
     pub applied: Vec<String>,
     pub suppressed: Vec<Suppression>,
     pub inapplicable: Vec<String>,
+    pub provenance: Vec<ProvenanceRange>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProvenanceRange {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: ProvenanceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    pub sources: Vec<SourceLocation>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvenanceKind {
+    Output,
+    RuleContent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +496,7 @@ impl Loader {
                     front_matter: raw.front_matter.clone(),
                     header,
                     templates,
+                    location: locate_mapping_key(&self.root, &self.config_path, "outputs", name),
                 },
             );
         }
@@ -478,6 +526,7 @@ impl Loader {
                         title: raw.title.clone(),
                         order: raw.order,
                         source: source.clone(),
+                        location: locate_id(&self.root, source, "sections", &raw.id),
                     },
                 );
             }
@@ -525,6 +574,25 @@ impl Loader {
             }
         }
 
+        let source_documents = documents
+            .iter()
+            .map(|(path, document)| SourceDocument {
+                path: path.clone(),
+                imports: document
+                    .imports
+                    .iter()
+                    .map(|import| SourceImport {
+                        path: path.parent().unwrap().join(&import.path),
+                        location: locate_import(&self.root, path, &import.path),
+                    })
+                    .collect(),
+                location: SourceLocation {
+                    path: display_relative(&self.root, path),
+                    line: 1,
+                    column: 1,
+                },
+            })
+            .collect();
         Ok(Project {
             root: self.root,
             config_path: self.config_path,
@@ -533,6 +601,7 @@ impl Loader {
             sections,
             rules,
             dependencies: self.dependencies,
+            documents: source_documents,
         })
     }
 
@@ -627,6 +696,14 @@ impl Loader {
             .collect::<Result<Vec<_>>>()?;
         let when = raw.when.as_ref().map(resolve_condition).transpose()?;
 
+        let content_location = content_source
+            .as_ref()
+            .map(|path| SourceLocation {
+                path: display_relative(&self.root, path),
+                line: 1,
+                column: 1,
+            })
+            .unwrap_or_else(|| locate_rule_content(&self.root, source, &raw.id));
         Ok(Rule {
             id: raw.id.clone(),
             slot: raw.slot.clone(),
@@ -637,6 +714,8 @@ impl Loader {
             content,
             source: source.to_path_buf(),
             content_source,
+            location: locate_id(&self.root, source, "rules", &raw.id),
+            content_location,
             when,
             checks,
         })
@@ -687,7 +766,36 @@ impl Loader {
             !content.trim().is_empty(),
             "{kind} for output {output} may not be empty"
         );
-        Ok(Template { content, source })
+        let location = source
+            .as_ref()
+            .map(|path| SourceLocation {
+                path: display_relative(&self.root, path),
+                line: 1,
+                column: 1,
+            })
+            .unwrap_or_else(|| SourceLocation {
+                ..locate_output_template(&self.root, &self.config_path, output, raw)
+            });
+        let source_locations = source
+            .as_ref()
+            .map(|path| {
+                content
+                    .lines()
+                    .enumerate()
+                    .map(|(index, line)| SourceLocation {
+                        path: display_relative(&self.root, path),
+                        line: index + 1,
+                        column: line.len() - line.trim_start().len() + 1,
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![location.clone()]);
+        Ok(Template {
+            content,
+            source,
+            location,
+            source_locations,
+        })
     }
 }
 
@@ -1029,7 +1137,9 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
             }
         }
 
-        let content = render_output(project, output, &selected, &source_fingerprint)?;
+        let marked_content = render_output(project, output, &selected, &source_fingerprint)?;
+        let provenance = build_provenance(project, output, &selected, &marked_content);
+        let content = strip_provenance_markers(&marked_content, project, output, &selected);
         let applied = selected
             .iter()
             .map(|rule| rule.id.clone())
@@ -1045,6 +1155,7 @@ pub fn compile_project(project: &Project) -> Result<CompiledProject> {
                 applied,
                 suppressed,
                 inapplicable,
+                provenance,
             },
         );
     }
@@ -1316,7 +1427,13 @@ fn render_output(
             }
             current_section = Some(&rule.section);
         }
-        current_content.push(rule.content.trim_end().to_owned());
+        current_content.push(mark_rule(
+            project,
+            output,
+            rules,
+            rule,
+            rule.content.trim_end(),
+        ));
     }
     if let Some(section_id) = current_section {
         rendered_sections.push(render_section(
@@ -2096,7 +2213,7 @@ fn validate_id(id: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
-fn normalize_relative(path: &Path) -> Result<PathBuf> {
+pub(crate) fn normalize_relative(path: &Path) -> Result<PathBuf> {
     ensure!(!path.as_os_str().is_empty(), "path may not be empty");
     ensure!(
         !path.is_absolute(),
@@ -2174,6 +2291,545 @@ fn path_string(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn locate_mapping_key(root: &Path, path: &Path, parent: &str, key: &str) -> SourceLocation {
+    locate_yaml(root, path, |lines| {
+        let mut in_parent = false;
+        let mut parent_indent = 0;
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if trimmed == format!("{parent}:") {
+                in_parent = true;
+                parent_indent = indent;
+                continue;
+            }
+            if trimmed.starts_with(&format!("{parent}:")) {
+                let key_patterns = [
+                    format!("{key}:"),
+                    format!("\"{key}\":"),
+                    format!("'{key}':"),
+                ];
+                if let Some(offset) = key_patterns
+                    .iter()
+                    .find_map(|pattern| line.find(pattern).map(|offset| offset + 1))
+                {
+                    return Some((index + 1, offset));
+                }
+                in_parent = true;
+                parent_indent = indent;
+                continue;
+            }
+            if in_parent && !trimmed.is_empty() && indent <= parent_indent {
+                break;
+            }
+            if in_parent && trimmed.starts_with(&format!("{key}:")) {
+                return Some((index + 1, indent + 1));
+            }
+        }
+        None
+    })
+}
+
+fn locate_import(root: &Path, path: &Path, import: &Path) -> SourceLocation {
+    locate_yaml(root, path, |lines| {
+        let mut in_imports = false;
+        let mut parent_indent = 0;
+        let expected = import.to_string_lossy();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if trimmed.starts_with("imports:") {
+                in_imports = true;
+                parent_indent = indent;
+                if let Some(offset) = line.find("path:") {
+                    let value_start = offset + 5;
+                    let value = line[value_start..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches(['\'', '"', ',', '}', ']']);
+                    if value == expected {
+                        return Some((
+                            index + 1,
+                            value_start + line[value_start..].len()
+                                - line[value_start..].trim_start().len()
+                                + 1,
+                        ));
+                    }
+                }
+                continue;
+            }
+            if in_imports && !trimmed.is_empty() && indent <= parent_indent {
+                break;
+            }
+            if in_imports && let Some(offset) = line.find("path:") {
+                let value_start = offset + 5;
+                let value = line[value_start..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(['\'', '"', ',', '}', ']']);
+                if value == expected {
+                    return Some((
+                        index + 1,
+                        value_start + line[value_start..].len()
+                            - line[value_start..].trim_start().len()
+                            + 1,
+                    ));
+                }
+            }
+        }
+        None
+    })
+}
+
+fn locate_id(root: &Path, path: &Path, parent: &str, id: &str) -> SourceLocation {
+    locate_yaml(root, path, |lines| {
+        let mut in_parent = false;
+        let mut parent_indent = 0;
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if trimmed.starts_with(&format!("{parent}:")) {
+                in_parent = true;
+                parent_indent = indent;
+            }
+            if in_parent
+                && index > 0
+                && !trimmed.is_empty()
+                && indent <= parent_indent
+                && !trimmed.starts_with(&format!("{parent}:"))
+            {
+                break;
+            }
+            if in_parent {
+                let mut offset = 0;
+                while let Some(found) = line[offset..].find("id:") {
+                    let key = offset + found;
+                    let prefix = line[..key].trim_end();
+                    let before_ok = prefix.is_empty() || prefix.ends_with(['-', '{', '[']);
+                    if indent > parent_indent + 2 && prefix.is_empty() {
+                        offset = key + 3;
+                        continue;
+                    }
+                    let value = line[key + 3..].trim_start();
+                    let value = value.trim_start_matches(['\'', '"']);
+                    let end = value
+                        .find([',', '}', ']', '\'', '"', ' '])
+                        .unwrap_or(value.len());
+                    if before_ok && &value[..end] == id {
+                        return Some((index + 1, key + 1));
+                    }
+                    offset = key + 3;
+                }
+            }
+        }
+        None
+    })
+}
+
+fn locate_rule_content(root: &Path, path: &Path, id: &str) -> SourceLocation {
+    let rule = locate_id(root, path, "rules", id);
+    locate_yaml(root, path, |lines| {
+        for (index, line) in lines.iter().enumerate().skip(rule.line.saturating_sub(1)) {
+            let search_from = if index + 1 == rule.line {
+                rule.column.saturating_sub(1)
+            } else {
+                0
+            };
+            let tail = &line[search_from.min(line.len())..];
+            let trimmed = tail.trim_start();
+            if index + 1 > rule.line && (trimmed.starts_with("- id:") || trimmed.contains("{ id:"))
+            {
+                break;
+            }
+            let inline = tail.find("inline:").map(|offset| (offset, true));
+            let file = tail.find("file:").map(|offset| (offset, false));
+            if let Some((offset, is_inline)) = inline.into_iter().chain(file).min_by_key(|x| x.0) {
+                let key_column = search_from + offset;
+                let value = line[key_column + if is_inline { 7 } else { 5 }..].trim_start();
+                let block = is_inline && (value.starts_with('|') || value.starts_with('>'));
+                let value_column = line.len() - value.len() + 1;
+                if block {
+                    let mut content_index = index + 1;
+                    while content_index < lines.len() && lines[content_index].trim().is_empty() {
+                        content_index += 1;
+                    }
+                    if let Some(content_line) = lines.get(content_index) {
+                        let next_indent = content_line.len() - content_line.trim_start().len();
+                        return Some((content_index + 1, next_indent + 1));
+                    }
+                }
+                return Some((index + 1 + usize::from(block), value_column));
+            }
+        }
+        None
+    })
+}
+
+fn locate_yaml(
+    root: &Path,
+    path: &Path,
+    finder: impl FnOnce(&[&str]) -> Option<(usize, usize)>,
+) -> SourceLocation {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let lines = text.lines().collect::<Vec<_>>();
+    let (line, column) = finder(&lines).unwrap_or((1, 1));
+    SourceLocation {
+        path: display_relative(root, path),
+        line,
+        column,
+    }
+}
+
+fn build_provenance(
+    project: &Project,
+    output: &Output,
+    rules: &[&Rule],
+    content: &str,
+) -> Vec<ProvenanceRange> {
+    let sanitized = strip_provenance_markers(content, project, output, rules);
+    let total_lines = sanitized.lines().count().max(1);
+    let mut ranges = Vec::new();
+    for rule in rules {
+        let start_marker = provenance_marker(project, output, rules, rule, "start");
+        let end_marker = provenance_marker(project, output, rules, rule, "end");
+        let mut cursor = 0;
+        while let Some(relative) = content[cursor..].find(&start_marker) {
+            let start_byte = cursor + relative;
+            let after_start = start_byte + start_marker.len();
+            let Some(end_relative) = content[after_start..].find(&end_marker) else {
+                break;
+            };
+            let end_byte = after_start + end_relative;
+            let start_line = sanitized
+                [..strip_marker_offset(content, start_byte, project, output, rules)]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let end_line = sanitized
+                [..strip_marker_offset(content, end_byte, project, output, rules)]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            ranges.push(ProvenanceRange {
+                start_line,
+                end_line,
+                kind: ProvenanceKind::RuleContent,
+                rule: Some(rule.id.clone()),
+                section: Some(rule.section.clone()),
+                sources: {
+                    let mut sources = vec![rule.location.clone(), rule.content_location.clone()];
+                    for generated_line in start_line..=end_line {
+                        sources.extend(template_sources_for_line(
+                            output,
+                            sanitized.lines().nth(generated_line - 1).unwrap_or(""),
+                            true,
+                            true,
+                        ));
+                    }
+                    sources.extend(template_placeholder_sources(output, true));
+                    sources.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+                    sources.dedup();
+                    sources
+                },
+            });
+            cursor = end_byte + end_marker.len();
+        }
+    }
+    ranges.sort_by_key(|range| range.start_line);
+    let mut complete = Vec::new();
+    let mut next = 1;
+    for range in ranges {
+        if next < range.start_line {
+            for generated_line in next..range.start_line {
+                let mut sources = template_sources_for_line(
+                    output,
+                    sanitized.lines().nth(generated_line - 1).unwrap_or(""),
+                    true,
+                    false,
+                );
+                if sanitized
+                    .lines()
+                    .nth(generated_line - 1)
+                    .is_some_and(|line| line.trim_start().starts_with("## "))
+                    && let Some(section) = range
+                        .section
+                        .as_ref()
+                        .and_then(|id| project.sections.get(id))
+                {
+                    sources.push(section.location.clone());
+                }
+                complete.push(ProvenanceRange {
+                    start_line: generated_line,
+                    end_line: generated_line,
+                    kind: ProvenanceKind::Output,
+                    rule: None,
+                    section: range.section.clone(),
+                    sources,
+                });
+            }
+        }
+        next = range.end_line + 1;
+        complete.push(range);
+    }
+    if next <= total_lines {
+        let section = rules.last().map(|rule| rule.section.clone());
+        for generated_line in next..=total_lines {
+            let mut sources = template_sources_for_line(
+                output,
+                sanitized.lines().nth(generated_line - 1).unwrap_or(""),
+                true,
+                false,
+            );
+            if sanitized
+                .lines()
+                .nth(generated_line - 1)
+                .is_some_and(|line| line.trim_start().starts_with("## "))
+                && let Some(value) = section.as_ref().and_then(|id| project.sections.get(id))
+            {
+                sources.push(value.location.clone());
+            }
+            complete.push(ProvenanceRange {
+                start_line: generated_line,
+                end_line: generated_line,
+                kind: ProvenanceKind::Output,
+                rule: None,
+                section: section.clone(),
+                sources,
+            });
+        }
+    }
+    complete
+}
+
+fn template_sources_for_line(
+    output: &Output,
+    generated_line: &str,
+    include_section: bool,
+    include_section_placeholder: bool,
+) -> Vec<SourceLocation> {
+    let mut sources = Vec::new();
+    let templates = [
+        match &output.header {
+            Header::Template(template) => Some(template),
+            _ => None,
+        },
+        output.templates.output.as_ref(),
+        include_section
+            .then_some(output.templates.section.as_ref())
+            .flatten(),
+    ];
+    for template in templates.into_iter().flatten() {
+        for (index, template_line) in template.content.lines().enumerate() {
+            let template_text = template_line.trim();
+            if template_line_matches(template_text, generated_line.trim()) {
+                sources.push(
+                    template
+                        .source_locations
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| template.location.clone()),
+                );
+            }
+        }
+    }
+    if sources.is_empty() {
+        sources = template_placeholder_sources(output, include_section_placeholder);
+    }
+    if sources.is_empty() {
+        sources.push(output.location.clone());
+    }
+    sources.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+    sources.dedup();
+    sources
+}
+
+fn template_line_matches(template_line: &str, generated_line: &str) -> bool {
+    if template_line.is_empty() {
+        return false;
+    }
+    if !template_line.contains("{{") {
+        return template_line == generated_line || generated_line.contains(template_line);
+    }
+    let mut remaining = template_line;
+    let mut saw_literal = false;
+    while let Some(start) = remaining.find("{{") {
+        let literal = remaining[..start].trim();
+        if !literal.is_empty() {
+            saw_literal = true;
+            if generated_line.contains(literal) {
+                return true;
+            }
+        }
+        let Some(end) = remaining[start + 2..].find("}}") else {
+            break;
+        };
+        remaining = &remaining[start + 2 + end + 2..];
+    }
+    let literal = remaining.trim();
+    saw_literal && !literal.is_empty() && generated_line.contains(literal)
+}
+
+fn template_placeholder_sources(output: &Output, include_section: bool) -> Vec<SourceLocation> {
+    let templates = [
+        match &output.header {
+            Header::Template(template) => Some(template),
+            _ => None,
+        },
+        output.templates.output.as_ref(),
+        include_section
+            .then_some(output.templates.section.as_ref())
+            .flatten(),
+    ];
+    let mut sources = Vec::new();
+    for template in templates.into_iter().flatten() {
+        for (index, line) in template.content.lines().enumerate() {
+            if line.contains("{{content}}") || line.contains("{{sections}}") {
+                sources.push(
+                    template
+                        .source_locations
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| template.location.clone()),
+                );
+            }
+        }
+    }
+    sources.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+    sources.dedup();
+    sources
+}
+
+fn provenance_marker(
+    project: &Project,
+    output: &Output,
+    rules: &[&Rule],
+    rule: &Rule,
+    edge: &str,
+) -> String {
+    let mut marker = format!(
+        "__ctcx_provenance_{}_{}_{}__",
+        sha256(rule.content.as_bytes()),
+        edge,
+        rule.id
+    );
+    while marker_collides(project, output, rules, &marker) {
+        marker.push('x');
+    }
+    marker
+}
+
+fn mark_rule(
+    project: &Project,
+    output: &Output,
+    rules: &[&Rule],
+    rule: &Rule,
+    content: &str,
+) -> String {
+    format!(
+        "{}{}{}",
+        provenance_marker(project, output, rules, rule, "start"),
+        content,
+        provenance_marker(project, output, rules, rule, "end")
+    )
+}
+
+fn strip_provenance_markers(
+    content: &str,
+    project: &Project,
+    output: &Output,
+    rules: &[&Rule],
+) -> String {
+    let mut sanitized = content.to_owned();
+    for rule in rules {
+        for edge in ["start", "end"] {
+            let marker = provenance_marker(project, output, rules, rule, edge);
+            sanitized = sanitized.replace(&marker, "");
+        }
+    }
+    sanitized
+}
+
+fn strip_marker_offset(
+    content: &str,
+    byte_offset: usize,
+    project: &Project,
+    output: &Output,
+    rules: &[&Rule],
+) -> usize {
+    strip_provenance_markers(&content[..byte_offset], project, output, rules).len()
+}
+
+fn marker_collides(project: &Project, output: &Output, rules: &[&Rule], marker: &str) -> bool {
+    rules.iter().any(|rule| rule.content.contains(marker))
+        || project
+            .sections
+            .values()
+            .any(|section| section.title.contains(marker))
+        || project.name.contains(marker)
+        || output.name.contains(marker)
+        || path_string(&output.relative_path).contains(marker)
+        || output.format.name().contains(marker)
+        || output.title.contains(marker)
+        || serde_yaml_ng::to_string(&output.front_matter).is_ok_and(|value| value.contains(marker))
+        || output
+            .templates
+            .output
+            .as_ref()
+            .is_some_and(|template| template.content.contains(marker))
+        || output
+            .templates
+            .section
+            .as_ref()
+            .is_some_and(|template| template.content.contains(marker))
+        || matches!(&output.header, Header::Template(template) if template.content.contains(marker))
+}
+
+fn locate_output_template(
+    root: &Path,
+    path: &Path,
+    output: &str,
+    raw: &RawTemplate,
+) -> SourceLocation {
+    let output_location = locate_mapping_key(root, path, "outputs", output);
+    locate_yaml(root, path, |lines| {
+        let start = output_location.line.saturating_sub(1);
+        let base_indent = lines
+            .get(start)
+            .map(|line| line.len() - line.trim_start().len())
+            .unwrap_or(0);
+        for (index, line) in lines.iter().enumerate().skip(start) {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if index > start && !trimmed.is_empty() && indent <= base_indent {
+                break;
+            }
+            let key = if raw.file.is_some() {
+                "file:"
+            } else {
+                "inline:"
+            };
+            if let Some(column) = line.find(key) {
+                let matches_value = raw
+                    .file
+                    .as_ref()
+                    .is_some_and(|value| line.contains(&value.to_string_lossy().to_string()))
+                    || raw.inline.as_ref().is_some_and(|value| {
+                        let prefix = value.lines().next().unwrap_or("");
+                        prefix.is_empty() || line.contains(prefix)
+                    });
+                if matches_value {
+                    return Some((index + 1, column + 1));
+                }
+            }
+        }
+        None
+    })
 }
 
 fn selected_outputs<'a>(
