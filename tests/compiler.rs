@@ -1,7 +1,8 @@
 use anyhow::Result;
 use ctcx::{
-    BuildSafety, build_project, check_project, compile_project, explain_rule, explain_target,
-    init_project, load_project, render_diffs,
+    BuildSafety, GraphEdgeKind, ProvenanceKind, build_dependency_graph, build_project,
+    check_project, compile_project, explain_rule, explain_target, init_project, load_project,
+    render_diffs,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -199,6 +200,20 @@ rules:
         compiled.outputs["custom"].content,
         "BEGIN custom\n[workflow] Follow the workflow.\n"
     );
+    let custom = &compiled.outputs["custom"];
+    assert!(custom.provenance.iter().any(|range| {
+        range.kind == ProvenanceKind::RuleContent
+            && range.rule.as_deref() == Some("workflow")
+            && range.start_line == 2
+            && range.sources.len() >= 3
+    }));
+    assert!(custom.provenance.iter().any(|range| {
+        range.kind == ProvenanceKind::Output
+            && range
+                .sources
+                .iter()
+                .any(|source| source.path == "ctcx.yaml")
+    }));
     Ok(())
 }
 
@@ -915,6 +930,17 @@ fn conditions_control_rule_eligibility_precedence_checks_and_explain_output() ->
     let rule_explanation = explain_rule(&project, &compiled, "disabled-package-manager")?;
     assert!(rule_explanation.contains("agents: inapplicable (condition evaluated false)"));
     assert!(rule_explanation.contains("claude: not targeted"));
+    let graph = build_dependency_graph(&project, &compiled);
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kind == GraphEdgeKind::SuppressedBy
+            && edge.from == "rule:default-package-manager"
+            && edge.to == "rule:conditional-package-manager"
+    }));
+    assert!(graph.edges.iter().any(|edge| {
+        edge.kind == GraphEdgeKind::Inapplicable
+            && edge.from == "rule:disabled-package-manager"
+            && edge.to == "output:agents"
+    }));
     Ok(())
 }
 

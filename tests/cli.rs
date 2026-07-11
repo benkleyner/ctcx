@@ -125,3 +125,107 @@ fn cli_validate_reports_aggregated_guardrail_failures() {
                 )),
         );
 }
+
+#[test]
+fn cli_renders_graph_in_text_dot_and_versioned_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("ctcx.yaml");
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args(["--config", config.to_str().unwrap(), "init"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args(["--config", config.to_str().unwrap(), "graph"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--applies-->"));
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "graph",
+            "--format",
+            "dot",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("digraph ctcx"));
+    let json = Command::cargo_bin("ctcx")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "graph",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert!(
+        value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "output")
+    );
+    assert!(
+        value["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|status| status["status"] == "applied")
+    );
+}
+
+#[test]
+fn cli_why_maps_expected_lines_and_validates_the_range() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("ctcx.yaml");
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args(["--config", config.to_str().unwrap(), "init"])
+        .assert()
+        .success();
+    let agents = std::fs::read_to_string(temp.path().join("AGENTS.md")).unwrap();
+    let line = agents
+        .lines()
+        .position(|line| line.contains("Describe the commands"))
+        .unwrap()
+        + 1;
+
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "why",
+            "./AGENTS.md",
+            "--line",
+            &line.to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("rule: project-workflow (applied)")
+                .and(predicate::str::contains("source: ctcx.yaml:")),
+        );
+    Command::cargo_bin("ctcx")
+        .unwrap()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "why",
+            "AGENTS.md",
+            "--line",
+            "999",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("valid range is 1..="));
+}

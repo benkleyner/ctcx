@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ctcx::{
-    BuildSafety, build_project, check_project, compile_project, discover_config, explain_rule,
-    explain_target, init_project, load_project, render_diffs,
+    BuildSafety, build_dependency_graph, build_project, check_project, compile_project,
+    discover_config, explain_line, explain_rule, explain_target, init_project, load_project,
+    render_diffs, render_graph_dot, render_graph_text,
 };
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -31,6 +32,13 @@ enum ColorChoice {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GraphFormat {
+    Text,
+    Dot,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,6 +76,17 @@ enum Command {
         slot: Option<String>,
         #[arg(long, conflicts_with_all = ["target", "slot"])]
         rule: Option<String>,
+    },
+    /// Show the complete dependency and rule-selection graph.
+    Graph {
+        #[arg(long, default_value = "text")]
+        format: GraphFormat,
+    },
+    /// Explain where one expected generated line came from.
+    Why {
+        output: PathBuf,
+        #[arg(long)]
+        line: usize,
     },
 }
 
@@ -173,6 +192,17 @@ fn run(cli: Cli) -> Result<()> {
             (None, Some(rule)) => print!("{}", explain_rule(&project, &compiled, &rule)?),
             _ => bail!("explain requires either --target <output> or --rule <rule-id>"),
         },
+        Command::Graph { format } => {
+            let graph = build_dependency_graph(&project, &compiled);
+            match format {
+                GraphFormat::Text => print!("{}", render_graph_text(&graph)),
+                GraphFormat::Dot => print!("{}", render_graph_dot(&graph)),
+                GraphFormat::Json => println!("{}", serde_json::to_string_pretty(&graph)?),
+            }
+        }
+        Command::Why { output, line } => {
+            print!("{}", explain_line(&project, &compiled, &output, line)?);
+        }
     }
 
     Ok(())
